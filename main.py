@@ -66,7 +66,14 @@ def put_config(key, value):
 
 
 def chat_id():
+    """Private chat of the bot owner, established via /connect."""
     return int(ENV_CHAT_ID) if ENV_CHAT_ID else (int(get_config('chat_id')) if get_config('chat_id') else None)
+
+
+def notification_chat_id():
+    """Send new-order alerts to a bound group, or the owner's private chat."""
+    group_id = get_config('notify_chat_id')
+    return int(group_id) if group_id else chat_id()
 
 
 def tg_call(method, payload, timeout=20):
@@ -244,7 +251,7 @@ def last_stored_order():
 
 
 def poll_once():
-    destination = chat_id()
+    destination = notification_chat_id()
     if destination is None:
         LOG.info('Waiting for Telegram connection: /connect <SETUP_CODE>')
         return
@@ -309,23 +316,33 @@ def worker():
 def handle_update(update):
     msg = update.get('message') or {}
     where = msg.get('chat') or {}
-    if where.get('type') != 'private':
+    kind = where.get('type')
+    if kind not in ('private', 'group', 'supergroup'):
         return
     ident = where.get('id')
+    sender = (msg.get('from') or {}).get('id')
     command = (msg.get('text') or '').strip().split()
     if not command:
         return
-    action = command[0].split('@')[0].lower()
-    allowed = chat_id()
-    if action == '/start':
-        if allowed == ident:
-            tg_send(ident, '✅ @zakazKiT_bot подключён. Команды: /last, /status, /test, /help.')
-        elif allowed is not None:
+    raw_action = command[0].lower()
+    if not raw_action.startswith('/'):
+        return
+    name_and_target = raw_action.split('@', 1)
+    if len(name_and_target) == 2 and name_and_target[1] != 'zakazkit_bot':
+        return
+    action = name_and_target[0]
+    owner = chat_id()
+
+    # Only private messages may contain the setup secret. Never share it in a group.
+    if kind == 'private' and action == '/start':
+        if owner == ident:
+            tg_send(ident, '✅ @zakazKiT_bot подключён. Команды: /last, /status, /test, /group, /private, /help.')
+        elif owner is not None:
             tg_send(ident, 'Этот бот уже привязан к владельцу.')
         else:
             tg_send(ident, 'Привет! Для подключения пришлите /connect КОД, установленный в Bothost.')
         return
-    if action == '/connect' and allowed is None:
+    if kind == 'private' and action == '/connect' and owner is None:
         if not SETUP_CODE:
             tg_send(ident, 'SETUP_CODE ещё не задан в переменных окружения Bothost.')
         elif len(command) == 2 and len(SETUP_CODE) >= 8 and command[1] == SETUP_CODE:
@@ -335,14 +352,57 @@ def handle_update(update):
         else:
             tg_send(ident, 'Неверный код. Проверьте SETUP_CODE в настройках Bothost.')
         return
-    if ident != allowed:
+
+    # The group is registered by the previously authenticated owner only.
+    # Other members may see alerts but cannot change routing or request orders.
+    authorized = (kind == 'private' and ident == owner or
+                  kind in ('group', 'supergroup') and sender == owner and owner is not None)
+
+    if kind in ('group', 'supergroup') and action == '/bindgroup':
+        if not authorized:
+            return
+        old_group_id = get_config('notify_chat_id')
+        put_config('notify_chat_id', ident)
+        LOG.info('Notifications routed to a Telegram group')
+        tg_send(ident, '✅ Группа подключена! Новые заказы Flowwow будут приходить сюда.\n'
+                       'Управление доступно только владельцу бота.\n'
+                       'Отключить: /unbindgroup@zakazKiT_bot')
+        if old_group_id and str(old_group_id) != str(ident):
+            LOG.info('Previous group was replaced')
+        return
+    if kind in ('group', 'supergroup') and action == '/unbindgroup':
+        if not authorized or str(ident) != str(get_config('notify_chat_id')):
+            return
+        put_config('notify_chat_id', '')
+        tg_send(ident, '✅ Группа отключена. Уведомления снова приходят владельцу в личные сообщения.')
+        return
+    if kind == 'private' and action == '/private' and authorized:
+        put_config('notify_chat_id', '')
+        tg_send(ident, '✅ Уведомления переключены в личный чат.')
+        return
+    if kind == 'private' and action == '/group' and authorized:
+        group = get_config('notify_chat_id')
+        if group:
+            tg_send(ident, '✅ Уведомления направляются в подключённую группу.\n'
+                           'Команда /private вернёт их в личный чат.')
+        else:
+            tg_send(ident, 'Сейчас уведомления приходят в личный чат.\n'
+                           'Чтобы подключить группу, добавьте туда @zakazKiT_bot, '
+                           'затем отправьте от своего аккаунта /bindgroup@zakazKiT_bot.')
+        return
+
+    if not authorized:
+        return
+    # Do not let commands in unrelated groups disclose any order data.
+    if kind in ('group', 'supergroup') and str(ident) != str(get_config('notify_chat_id')):
         return
     if action == '/status':
         with db() as c:
             shops = c.execute('SELECT COUNT(*) FROM shops_initialized').fetchone()[0]
             total = c.execute('SELECT COUNT(*) FROM orders WHERE notified=1').fetchone()[0]
             queued = c.execute('SELECT COUNT(*) FROM orders WHERE notified=0').fetchone()[0]
-        tg_send(ident, f'✅ Бот активен\nМагазинов: {shops}\nИзвестных заказов: {total}\nОжидают отправки: {queued}\nПроверка: каждые {POLL_SECONDS} сек.')
+        target = 'группа' if get_config('notify_chat_id') else 'личный чат'
+        tg_send(ident, f'✅ Бот активен\nМагазинов: {shops}\nИзвестных заказов: {total}\nОжидают отправки: {queued}\nПроверка: каждые {POLL_SECONDS} сек.\nУведомления: {target}.')
     elif action == '/last':
         latest = last_stored_order()
         if latest is None:
@@ -354,7 +414,12 @@ def handle_update(update):
     elif action == '/test':
         tg_send(ident, '🔔 Тестовое уведомление @zakazKiT_bot — Telegram подключён.')
     elif action == '/help':
-        tg_send(ident, '/last — показать последний сохранённый заказ\n/status — состояние\n/test — проверить доставку уведомлений\n/help — помощь')
+        tg_send(ident, '/last — показать последний сохранённый заказ\n'
+                       '/status — состояние\n/test — проверить доставку\n'
+                       '/bindgroup — привязать группу (от владельца, в группе)\n'
+                       '/unbindgroup — отвязать группу (от владельца, в группе)\n'
+                       '/group — куда приходят уведомления (в личном чате)\n'
+                       '/private — вернуть уведомления в личный чат\n/help — помощь')
 
 
 def telegram_loop():
