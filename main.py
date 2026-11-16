@@ -176,9 +176,9 @@ def esc(value):
     return html.escape(str(value), quote=False)
 
 
-def format_order(order, shop_name):
+def format_order(order, shop_name, *, title='🔔 <b>Новый заказ Flowwow!</b>'):
     order_id = order.get('id', '—')
-    lines = ['🔔 <b>Новый заказ Flowwow!</b>', '',
+    lines = [title, '',
              f'<b>Заказ № {esc(order_id)}</b>',
              f'🏪 Магазин: {esc(shop_name)}',
              f'🕒 Создан: {esc(local_timestamp(order.get("createdDate")))} (МСК)']
@@ -214,6 +214,35 @@ def format_order(order, shop_name):
     return '\n'.join(lines)[:3950]
 
 
+def last_stored_order():
+    """Return the newest order already synchronized from Flowwow.
+
+    Compare creation timestamps rather than relying on order ID ordering.
+    Does not request or modify any live Flowwow order.
+    """
+    with db() as c:
+        rows = c.execute('SELECT shop_id, order_id, payload FROM orders').fetchall()
+    latest = None
+    latest_key = None
+    for shop_id, order_id, payload in rows:
+        try:
+            order = json.loads(payload)
+            if not isinstance(order, dict):
+                continue
+            raw_date = order.get('createdDate')
+            timestamp = int(raw_date) if raw_date is not None else 0
+            # Normalize milliseconds for comparisons.
+            if timestamp > 10**11:
+                timestamp //= 1000
+            key = (timestamp, int(order_id))
+        except (ValueError, TypeError, OverflowError, json.JSONDecodeError):
+            continue
+        if latest_key is None or key > latest_key:
+            latest = (shop_id, order)
+            latest_key = key
+    return latest
+
+
 def poll_once():
     destination = chat_id()
     if destination is None:
@@ -225,6 +254,7 @@ def poll_once():
         return
     today = datetime.now(MOSCOW).date()
     for shop_id, name in shops.items():
+        put_config(f'shop_name_{shop_id}', name)
         # Collect all requested dates first. A failed API call must not initialize a shop.
         fresh = {}
         for days_ago in range(LOOKBACK_DAYS):
@@ -289,7 +319,7 @@ def handle_update(update):
     allowed = chat_id()
     if action == '/start':
         if allowed == ident:
-            tg_send(ident, '✅ @zakazKiT_bot подключён. Команды: /status, /test, /help.')
+            tg_send(ident, '✅ @zakazKiT_bot подключён. Команды: /last, /status, /test, /help.')
         elif allowed is not None:
             tg_send(ident, 'Этот бот уже привязан к владельцу.')
         else:
@@ -313,10 +343,18 @@ def handle_update(update):
             total = c.execute('SELECT COUNT(*) FROM orders WHERE notified=1').fetchone()[0]
             queued = c.execute('SELECT COUNT(*) FROM orders WHERE notified=0').fetchone()[0]
         tg_send(ident, f'✅ Бот активен\nМагазинов: {shops}\nИзвестных заказов: {total}\nОжидают отправки: {queued}\nПроверка: каждые {POLL_SECONDS} сек.')
+    elif action == '/last':
+        latest = last_stored_order()
+        if latest is None:
+            tg_send(ident, '📭 Пока нет сохранённых заказов Flowwow. Дождитесь первой успешной синхронизации.')
+        else:
+            shop_id, order = latest
+            name = get_config(f'shop_name_{shop_id}') or f'Магазин №{shop_id}'
+            tg_send(ident, format_order(order, name, title='📋 <b>Последний сохранённый заказ Flowwow</b>'))
     elif action == '/test':
         tg_send(ident, '🔔 Тестовое уведомление @zakazKiT_bot — Telegram подключён.')
     elif action == '/help':
-        tg_send(ident, '/status — состояние\n/test — проверить доставку уведомлений\n/help — помощь')
+        tg_send(ident, '/last — показать последний сохранённый заказ\n/status — состояние\n/test — проверить доставку уведомлений\n/help — помощь')
 
 
 def telegram_loop():
