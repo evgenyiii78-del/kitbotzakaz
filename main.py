@@ -22,7 +22,8 @@ TG_TOKEN = (os.environ.get('TELEGRAM_BOT_TOKEN') or os.environ.get('BOT_TOKEN') 
 SETUP_CODE = os.environ.get('SETUP_CODE', '').strip()
 ENV_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '').strip()
 DATABASE_PATH = Path(os.environ.get('DATABASE_PATH', '/app/data/flowwow_orders.db' if Path('/app').exists() else './data/flowwow_orders.db'))
-POLL_SECONDS = max(30, int(os.environ.get('POLL_SECONDS', '60')))
+POLL_SECONDS = max(30, int(os.environ.get('POLL_SECONDS', '30')))
+MAX_OLDER_CHECKS = max(1, min(30, int(os.environ.get('MAX_OLDER_CHECKS', '10'))))
 LOOKBACK_DAYS = max(1, min(7, int(os.environ.get('LOOKBACK_DAYS', '2'))))
 MOSCOW = timezone(timedelta(hours=3))
 API_TIMEOUT = 25
@@ -51,6 +52,23 @@ def init_db():
                      shop_id INTEGER NOT NULL, order_id INTEGER NOT NULL,
                      payload TEXT NOT NULL, notified INTEGER NOT NULL DEFAULT 0,
                      PRIMARY KEY(shop_id, order_id))''')
+        columns = {row[1] for row in c.execute('PRAGMA table_info(orders)').fetchall()}
+        # Safe, non-destructive migration for existing SQLite databases on Bothost.
+        for column, definition in (
+            ('status_code', 'INTEGER'),
+            ('message_id', 'INTEGER'),
+            ('message_chat_id', 'INTEGER'),
+        ):
+            if column not in columns:
+                c.execute(f'ALTER TABLE orders ADD COLUMN {column} {definition}')
+        c.execute('''CREATE TABLE IF NOT EXISTS status_events (
+                     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     shop_id INTEGER NOT NULL,
+                     order_id INTEGER NOT NULL,
+                     old_status INTEGER,
+                     new_status INTEGER NOT NULL,
+                     delivered INTEGER NOT NULL DEFAULT 0,
+                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)''')
 
 
 def get_config(key):
@@ -86,8 +104,22 @@ def tg_call(method, payload, timeout=20):
 
 
 def tg_send(destination, body):
-    tg_call('sendMessage', {'chat_id': destination, 'text': body[:4000], 'parse_mode': 'HTML',
-                            'disable_web_page_preview': True}, timeout=15)
+    return tg_call('sendMessage', {'chat_id': destination, 'text': body[:4000], 'parse_mode': 'HTML',
+                                   'disable_web_page_preview': True}, timeout=15)
+
+
+def tg_edit(destination, message_id, body):
+    try:
+        return tg_call('editMessageText', {
+            'chat_id': destination, 'message_id': message_id,
+            'text': body[:4000], 'parse_mode': 'HTML',
+            'disable_web_page_preview': True,
+        }, timeout=15)
+    except requests.HTTPError as exc:
+        message = exc.response.text.lower() if exc.response is not None else ''
+        if 'message is not modified' in message:
+            return None
+        raise
 
 
 def flowwow(method, route, *, params=None, payload=None):
@@ -183,12 +215,41 @@ def esc(value):
     return html.escape(str(value), quote=False)
 
 
+STATUS_LABELS = {
+    1: '🆕 Новый',
+    2: '✅ Принят',
+    3: '🏁 Завершён',
+    4: '🚚 Передан в доставку',
+    5: '📷 Фото до доставки',
+    7: '🏪 Ожидает самовывоза',
+    10: '📦 Заказ собран (почта)',
+    11: '🚚 Доставляется почтой',
+    12: '📮 Ожидает получения на почте',
+}
+
+
+def status_value(order):
+    raw = order.get('status') if isinstance(order, dict) else None
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def status_label(code):
+    return STATUS_LABELS.get(code, f'Статус №{code}' if code is not None else 'Неизвестен')
+
+
 def format_order(order, shop_name, *, title='🔔 <b>Новый заказ Flowwow!</b>'):
     order_id = order.get('id', '—')
     lines = [title, '',
              f'<b>Заказ № {esc(order_id)}</b>',
              f'🏪 Магазин: {esc(shop_name)}',
              f'🕒 Создан: {esc(local_timestamp(order.get("createdDate")))} (МСК)']
+    if order.get('status') is not None:
+        lines.append(f'📌 Статус: <b>{esc(status_label(status_value(order)))}</b>')
     if order.get('deliveryDateFrom'):
         delivery = local_timestamp(order.get('deliveryDateFrom'))
         if order.get('deliveryDateTo') and order['deliveryDateTo'] != order['deliveryDateFrom']:
@@ -250,6 +311,141 @@ def last_stored_order():
     return latest
 
 
+def fetch_order_detail(shop_id, order_id):
+    """Fetch an older active order even when it is outside LOOKBACK_DAYS."""
+    item = flowwow('GET', '/apiseller/orders/view',
+                   params={'shopId': shop_id, 'orderId': order_id})
+    if int(item.get('id', -1)) != int(order_id):
+        raise ValueError('Flowwow returned mismatched order ID for /orders/view')
+    return item
+
+
+def refresh_stored_orders(shop_id, fresh):
+    """Check older unfinished orders in bounded rotating batches."""
+    with db() as c:
+        rows = c.execute('''SELECT order_id,payload,status_code FROM orders
+                            WHERE shop_id=? AND (status_code IS NULL OR status_code != 3)
+                            ORDER BY order_id''', (shop_id,)).fetchall()
+    remaining = []
+    for oid, payload, status in rows:
+        if oid in fresh:
+            continue
+        if status is None:
+            try:
+                if status_value(json.loads(payload)) == 3:
+                    continue
+            except (ValueError, TypeError):
+                pass
+        remaining.append(oid)
+    if not remaining:
+        return
+    cursor_key = f'older_cursor_{shop_id}'
+    start = int(get_config(cursor_key) or 0) % len(remaining)
+    chosen = [remaining[(start + idx) % len(remaining)]
+              for idx in range(min(len(remaining), MAX_OLDER_CHECKS))]
+    put_config(cursor_key, start + len(chosen))
+    for order_id in chosen:
+        try:
+            fresh[order_id] = fetch_order_detail(shop_id, order_id)
+        except RateLimit:
+            raise
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else '?'
+            LOG.warning('Cannot refresh older order %s/%s (HTTP %s)', shop_id, order_id, status)
+        except Exception as exc:
+            LOG.warning('Cannot refresh older order %s/%s: %s', shop_id, order_id, type(exc).__name__)
+
+
+def sync_shop_orders(shop_id, fresh):
+    """Persist latest API state and enqueue each detected status transition once."""
+    with db() as c:
+        baseline = c.execute('SELECT 1 FROM shops_initialized WHERE shop_id=?', (shop_id,)).fetchone() is None
+        for order_id, payload in fresh.items():
+            status = status_value(payload)
+            raw = json.dumps(payload, ensure_ascii=False)
+            prior = c.execute('''SELECT payload,notified,status_code
+                                 FROM orders WHERE shop_id=? AND order_id=?''',
+                              (shop_id, order_id)).fetchone()
+            if prior is None:
+                c.execute('''INSERT INTO orders(shop_id,order_id,payload,notified,status_code)
+                             VALUES(?,?,?,?,?)''',
+                          (shop_id, order_id, raw, 1 if baseline else 0, status))
+                continue
+            old_payload, notified, stored_status = prior
+            if stored_status is None:
+                try:
+                    stored_status = status_value(json.loads(old_payload))
+                except (ValueError, TypeError):
+                    stored_status = None
+            if status is not None and stored_status is not None and status != stored_status and notified:
+                c.execute('''INSERT INTO status_events(shop_id,order_id,old_status,new_status)
+                             VALUES(?,?,?,?)''', (shop_id, order_id, stored_status, status))
+                LOG.info('Status changed for order %s/%s: %s -> %s',
+                         shop_id, order_id, stored_status, status)
+            # Keep payload synchronized, even when status is unchanged.
+            c.execute('''UPDATE orders SET payload=?,status_code=? WHERE shop_id=? AND order_id=?''',
+                      (raw, status if status is not None else stored_status, shop_id, order_id))
+        if baseline:
+            c.execute('INSERT INTO shops_initialized(shop_id) VALUES(?)', (shop_id,))
+    return baseline
+
+
+def is_missing_edit_target(exc):
+    if not isinstance(exc, requests.HTTPError) or exc.response is None:
+        return False
+    if exc.response.status_code not in (400, 404):
+        return False
+    body = exc.response.text.lower()
+    return ('message to edit not found' in body or
+            "message can't be edited" in body or
+            'message_id_invalid' in body)
+
+
+def deliver_shop_updates(shop_id, name, destination):
+    with db() as c:
+        pending = c.execute('''SELECT o.order_id,o.payload,o.notified,o.message_id,o.message_chat_id
+             FROM orders o
+             WHERE o.shop_id=? AND (o.notified=0 OR EXISTS (
+                 SELECT 1 FROM status_events e
+                 WHERE e.shop_id=o.shop_id AND e.order_id=o.order_id AND e.delivered=0))
+             ORDER BY o.order_id''', (shop_id,)).fetchall()
+    for oid, raw, notified, message_id, message_chat in pending:
+        try:
+            current = json.loads(raw)
+            card = format_order(current, name, title='🍰 <b>Заказ Flowwow</b>')
+            if message_id is not None and message_chat == destination:
+                try:
+                    tg_edit(destination, message_id, card)
+                except requests.HTTPError as exc:
+                    if not is_missing_edit_target(exc):
+                        raise
+                    result = tg_send(destination, card)
+                    message_id = int(result['message_id'])
+            else:
+                result = tg_send(destination, card)
+                message_id = int(result['message_id'])
+            with db() as c:
+                c.execute('''UPDATE orders SET notified=1,message_id=?,message_chat_id=?
+                             WHERE shop_id=? AND order_id=?''',
+                          (message_id, destination, shop_id, oid))
+            with db() as c:
+                events = c.execute('''SELECT event_id,old_status,new_status
+                    FROM status_events WHERE shop_id=? AND order_id=? AND delivered=0
+                    ORDER BY event_id''', (shop_id, oid)).fetchall()
+            for event_id, old_status, new_status in events:
+                note = (f'🔄 <b>Статус заказа №{esc(oid)} изменился</b>\n'
+                        f'🏪 {esc(name)}\n'
+                        f'{esc(status_label(old_status))} → <b>{esc(status_label(new_status))}</b>')
+                tg_send(destination, note)
+                with db() as c:
+                    c.execute('UPDATE status_events SET delivered=1 WHERE event_id=?', (event_id,))
+            LOG.info('Order %s/%s card synchronized; %s status alerts', shop_id, oid, len(events))
+        except Exception as exc:
+            LOG.warning('Notification for order %s/%s failed: %s',
+                        shop_id, oid, type(exc).__name__)
+            break
+
+
 def poll_once():
     destination = notification_chat_id()
     if destination is None:
@@ -262,7 +458,6 @@ def poll_once():
     today = datetime.now(MOSCOW).date()
     for shop_id, name in shops.items():
         put_config(f'shop_name_{shop_id}', name)
-        # Collect all requested dates first. A failed API call must not initialize a shop.
         fresh = {}
         for days_ago in range(LOOKBACK_DAYS):
             day = (today - timedelta(days=days_ago)).isoformat()
@@ -270,31 +465,13 @@ def poll_once():
                 if not isinstance(order, dict) or order.get('id') is None:
                     raise ValueError('Flowwow returned an order without ID')
                 fresh[int(order['id'])] = order
-        with db() as c:
-            existing = c.execute('SELECT 1 FROM shops_initialized WHERE shop_id=?', (shop_id,)).fetchone()
-            baseline = not bool(existing)
-            for item_id, payload in fresh.items():
-                c.execute('''INSERT OR IGNORE INTO orders(shop_id,order_id,payload,notified)
-                             VALUES(?,?,?,?)''',
-                          (shop_id, item_id, json.dumps(payload, ensure_ascii=False), 1 if baseline else 0))
-            if baseline:
-                c.execute('INSERT INTO shops_initialized(shop_id) VALUES(?)', (shop_id,))
+        refresh_stored_orders(shop_id, fresh)
+        baseline = sync_shop_orders(shop_id, fresh)
         if baseline:
             LOG.info('Shop %s initialized (%d existing orders ignored)', shop_id, len(fresh))
             tg_send(destination, f'✅ Мониторинг Flowwow включён. Магазин: <b>{esc(name)}</b>. '
                                  f'Ранее созданные заказы не отправляю.')
-        with db() as c:
-            pending = c.execute('''SELECT order_id,payload FROM orders
-                                   WHERE shop_id=? AND notified=0 ORDER BY order_id''', (shop_id,)).fetchall()
-        for item_id, payload in pending:
-            try:
-                tg_send(destination, format_order(json.loads(payload), name))
-                with db() as c:
-                    c.execute('UPDATE orders SET notified=1 WHERE shop_id=? AND order_id=?', (shop_id, item_id))
-                LOG.info('Order %s/%s sent', shop_id, item_id)
-            except Exception as exc:
-                LOG.warning('Notification for order %s/%s failed: %s', shop_id, item_id, type(exc).__name__)
-                break  # Keep all unsent orders for the next check.
+        deliver_shop_updates(shop_id, name, destination)
 
 
 def worker():
@@ -336,7 +513,7 @@ def handle_update(update):
     # Only private messages may contain the setup secret. Never share it in a group.
     if kind == 'private' and action == '/start':
         if owner == ident:
-            tg_send(ident, '✅ @zakazKiT_bot подключён. Команды: /last, /status, /test, /group, /private, /help.')
+            tg_send(ident, '✅ @zakazKiT_bot подключён. Команды: /last, /status, /test, /teststatus, /group, /private, /help.')
         elif owner is not None:
             tg_send(ident, 'Этот бот уже привязан к владельцу.')
         else:
@@ -401,8 +578,9 @@ def handle_update(update):
             shops = c.execute('SELECT COUNT(*) FROM shops_initialized').fetchone()[0]
             total = c.execute('SELECT COUNT(*) FROM orders WHERE notified=1').fetchone()[0]
             queued = c.execute('SELECT COUNT(*) FROM orders WHERE notified=0').fetchone()[0]
+            pending_status = c.execute('SELECT COUNT(*) FROM status_events WHERE delivered=0').fetchone()[0]
         target = 'группа' if get_config('notify_chat_id') else 'личный чат'
-        tg_send(ident, f'✅ Бот активен\nМагазинов: {shops}\nИзвестных заказов: {total}\nОжидают отправки: {queued}\nПроверка: каждые {POLL_SECONDS} сек.\nУведомления: {target}.')
+        tg_send(ident, f'✅ Бот активен\nМагазинов: {shops}\nИзвестных заказов: {total}\nОжидают отправки: {queued}\nНовых событий статуса: {pending_status}\nПроверка: каждые {POLL_SECONDS} сек.\nУведомления: {target}.')
     elif action == '/last':
         latest = last_stored_order()
         if latest is None:
@@ -411,11 +589,22 @@ def handle_update(update):
             shop_id, order = latest
             name = get_config(f'shop_name_{shop_id}') or f'Магазин №{shop_id}'
             tg_send(ident, format_order(order, name, title='📋 <b>Последний сохранённый заказ Flowwow</b>'))
+    elif action == '/teststatus':
+        demo = {'id': 'TEST', 'createdDate': int(datetime.now(MOSCOW).timestamp()),
+                'status': 1, 'products': [{'name': 'Тестовый бенто-торт', 'count': 1,
+                                          'sum': '1000', 'currencyCode': 'RUB'}]}
+        title = '🧪 <b>ТЕСТ — не настоящий заказ</b>'
+        result = tg_send(ident, format_order(demo, 'Кондитерская КиТ', title=title))
+        demo['status'] = 2
+        tg_edit(ident, int(result['message_id']), format_order(demo, 'Кондитерская КиТ', title=title))
+        tg_send(ident, '🧪 <b>Тест смены статуса</b>\n'
+                       '🆕 Новый → ✅ Принят\n'
+                       'Это демонстрация без запросов на изменение заказов Flowwow.')
     elif action == '/test':
         tg_send(ident, '🔔 Тестовое уведомление @zakazKiT_bot — Telegram подключён.')
     elif action == '/help':
         tg_send(ident, '/last — показать последний сохранённый заказ\n'
-                       '/status — состояние\n/test — проверить доставку\n'
+                       '/status — состояние\n/test — проверить доставку\n/teststatus — тест редактирования карточки\n'
                        '/bindgroup — привязать группу (от владельца, в группе)\n'
                        '/unbindgroup — отвязать группу (от владельца, в группе)\n'
                        '/group — куда приходят уведомления (в личном чате)\n'
