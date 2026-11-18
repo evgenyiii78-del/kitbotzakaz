@@ -148,5 +148,80 @@ class OrderTrackerTests(unittest.TestCase):
         flowwow.assert_not_called()
 
 
+    def test_menu_categories_and_filtering(self):
+        cases = [(101, 1, 'n'), (102, 2, 'a'), (103, 5, 'a'),
+                 (104, 4, 'd'), (105, 11, 'd'), (106, 3, 'c'),
+                 (107, 7, 'p'), (108, 99, 'o')]
+        for oid, status, _ in cases:
+            self.add_existing(status=status, oid=oid)
+        counts = bot.menu_counts(bot.stored_orders())
+        self.assertEqual(counts, {'n': 1, 'a': 2, 'd': 2, 'p': 1, 'c': 1, 'o': 1})
+        for oid, status, category in cases:
+            body, markup = bot.menu_section(category)
+            self.assertIn('Открыть', str(markup))
+            self.assertIn(f'№{oid}', body)
+        home, markup = bot.menu_home()
+        self.assertIn('Новые', str(markup))
+        self.assertIn('На доставке', str(markup))
+        self.assertIn('Принятые', str(markup))
+        self.assertIn('Всего в базе: <b>8</b>', home)
+
+    def test_menu_callback_owner_can_navigate_and_view_order(self):
+        self.add_existing(status=2, oid=432, chat=-10011)
+        bot.put_config('notify_chat_id', -10011)
+        query = {'id': 'callback-1', 'data': 'km:a:0',
+                 'from': {'id': 55}, 'message': {'message_id': 7,
+                     'chat': {'id': -10011, 'type': 'supergroup'}}}
+        with mock.patch.object(bot, 'chat_id', return_value=55), mock.patch.object(
+                bot, 'tg_call', return_value=True) as send_api, mock.patch.object(
+                bot, 'tg_edit', return_value={}) as edit:
+            bot.handle_callback(query)
+            self.assertIn('Принятые', edit.call_args.args[2])
+            self.assertEqual(send_api.call_args.args[0], 'answerCallbackQuery')
+            query['data'] = 'km:v:1:432:a:0'
+            bot.handle_callback(query)
+            self.assertIn('№ 432', edit.call_args.args[2])
+
+    def test_menu_callback_denies_other_group_member(self):
+        self.add_existing(status=2)
+        bot.put_config('notify_chat_id', -10011)
+        query = {'id': 'callback-2', 'data': 'km:a:0',
+                 'from': {'id': 99}, 'message': {'message_id': 7,
+                     'chat': {'id': -10011, 'type': 'supergroup'}}}
+        with mock.patch.object(bot, 'chat_id', return_value=55), mock.patch.object(
+                bot, 'tg_call', return_value=True) as send_api, mock.patch.object(
+                bot, 'tg_edit', return_value={}) as edit:
+            bot.handle_callback(query)
+            edit.assert_not_called()
+            self.assertIn('только владельцу', send_api.call_args.args[1]['text'])
+
+    def test_menu_command_in_private_chat(self):
+        self.add_existing(status=4)
+        with mock.patch.object(bot, 'chat_id', return_value=55), mock.patch.object(
+                bot, 'tg_send', return_value={'message_id': 7}) as send:
+            bot.handle_update({'message': {'chat': {'id': 55, 'type': 'private'},
+                                           'from': {'id': 55}, 'text': '/menu'}})
+            self.assertIn('inline_keyboard', send.call_args.kwargs['reply_markup'])
+            self.assertIn('Кондитерская КиТ', send.call_args.args[1])
+
+    def test_menu_pages_and_order_details(self):
+        for i in range(13):
+            self.add_existing(status=1, oid=100 + i)
+        body, markup = bot.menu_section('n', 1)
+        self.assertIn('Страница 2 из 3', body)
+        self.assertEqual(len(markup['inline_keyboard']), 8)  # 6 items, pager, navigation
+        body, markup = bot.render_menu_callback('km:v:1:102:n:0')
+        self.assertIn('№ 102', body)
+        self.assertIn('К списку', str(markup))
+
+    def test_configure_telegram_menu_calls_correct_methods(self):
+        with mock.patch.object(bot, 'tg_call', return_value=True) as api:
+            bot.configure_telegram_menu()
+        self.assertEqual([x.args[0] for x in api.call_args_list],
+                         ['setMyCommands', 'setChatMenuButton'])
+        commands = api.call_args_list[0].args[1]['commands']
+        self.assertIn('menu', [c['command'] for c in commands])
+
+
 if __name__ == '__main__':
     unittest.main()
