@@ -103,18 +103,22 @@ def tg_call(method, payload, timeout=20):
     return content['result']
 
 
-def tg_send(destination, body):
-    return tg_call('sendMessage', {'chat_id': destination, 'text': body[:4000], 'parse_mode': 'HTML',
-                                   'disable_web_page_preview': True}, timeout=15)
+def tg_send(destination, body, *, reply_markup=None):
+    payload = {'chat_id': destination, 'text': body[:4000],
+               'parse_mode': 'HTML', 'disable_web_page_preview': True}
+    if reply_markup is not None:
+        payload['reply_markup'] = reply_markup
+    return tg_call('sendMessage', payload, timeout=15)
 
 
-def tg_edit(destination, message_id, body):
+def tg_edit(destination, message_id, body, *, reply_markup=None):
     try:
-        return tg_call('editMessageText', {
-            'chat_id': destination, 'message_id': message_id,
-            'text': body[:4000], 'parse_mode': 'HTML',
-            'disable_web_page_preview': True,
-        }, timeout=15)
+        payload = {'chat_id': destination, 'message_id': message_id,
+                   'text': body[:4000], 'parse_mode': 'HTML',
+                   'disable_web_page_preview': True}
+        if reply_markup is not None:
+            payload['reply_markup'] = reply_markup
+        return tg_call('editMessageText', payload, timeout=15)
     except requests.HTTPError as exc:
         message = exc.response.text.lower() if exc.response is not None else ''
         if 'message is not modified' in message:
@@ -472,6 +476,7 @@ def poll_once():
             tg_send(destination, f'✅ Мониторинг Flowwow включён. Магазин: <b>{esc(name)}</b>. '
                                  f'Ранее созданные заказы не отправляю.')
         deliver_shop_updates(shop_id, name, destination)
+    put_config('last_sync_at', datetime.now(MOSCOW).strftime('%d.%m.%Y %H:%M:%S'))
 
 
 def worker():
@@ -488,6 +493,227 @@ def worker():
         except Exception as exc:
             LOG.exception('Order check failed: %s', type(exc).__name__)
         shutdown.wait(delay)
+
+
+
+# Inline keyboard keeps working in groups with Telegram's Privacy Mode enabled.
+# A command in Telegram's native Menu button opens this keyboard.
+MENU_CATEGORIES = {
+    'n': ('🆕 Новые', (1,)),
+    'a': ('✅ Принятые', (2, 5)),
+    'd': ('🚚 На доставке', (4, 11)),
+    'p': ('🏪 Самовывоз', (7, 12)),
+    'c': ('🏁 Завершённые', (3,)),
+    'o': ('📦 Другие', (10,)),
+}
+MENU_PAGE_SIZE = 6
+
+
+def menu_button(label, data):
+    return {'text': label, 'callback_data': data}
+
+
+def stored_orders():
+    """Read the locally synchronized orders. Browsing the menu does not call Flowwow."""
+    with db() as c:
+        rows = c.execute('SELECT shop_id,order_id,payload,status_code FROM orders').fetchall()
+    result = []
+    for shop_id, oid, raw, code in rows:
+        try:
+            payload = json.loads(raw)
+            if not isinstance(payload, dict):
+                continue
+            actual = code if code is not None else status_value(payload)
+            timestamp = payload.get('createdDate')
+            timestamp = int(timestamp) if timestamp is not None else 0
+            if timestamp > 10**11:
+                timestamp //= 1000
+            result.append((shop_id, oid, payload, actual, timestamp))
+        except (ValueError, TypeError, OverflowError, json.JSONDecodeError):
+            LOG.warning('Skipping malformed locally stored order %s/%s', shop_id, oid)
+    return sorted(result, key=lambda item: (item[4], item[1]), reverse=True)
+
+
+def category_for_status(code):
+    for key, (_, statuses) in MENU_CATEGORIES.items():
+        if code in statuses:
+            return key
+    return 'o'
+
+
+def menu_counts(rows):
+    counts = {key: 0 for key in MENU_CATEGORIES}
+    for _, _, _, code, _ in rows:
+        counts[category_for_status(code)] += 1
+    return counts
+
+
+def menu_home():
+    rows = stored_orders()
+    counts = menu_counts(rows)
+    last_sync = get_config('last_sync_at') or 'ещё нет'
+    body = ('🍰 <b>Кондитерская КиТ · Flowwow</b>\n'
+            'Выбери раздел, чтобы посмотреть заказы.\n'
+            f'Всего в базе: <b>{len(rows)}</b>\n'
+            f'Последняя синхронизация: {esc(last_sync)} (МСК)\n'
+            'Данные из базы, опрос API каждые 30 сек.')
+    markup = {'inline_keyboard': [
+        [menu_button(f'🆕 Новые · {counts["n"]}', 'km:n:0'),
+         menu_button(f'✅ Принятые · {counts["a"]}', 'km:a:0')],
+        [menu_button(f'🚚 На доставке · {counts["d"]}', 'km:d:0'),
+         menu_button(f'🏪 Самовывоз · {counts["p"]}', 'km:p:0')],
+        [menu_button(f'🏁 Завершённые · {counts["c"]}', 'km:c:0'),
+         menu_button(f'📦 Другие · {counts["o"]}', 'km:o:0')],
+        [menu_button('🕒 Последний заказ', 'km:l'),
+         menu_button('📊 Статистика', 'km:s')],
+        [menu_button('🔄 Обновить список', 'km:h')]
+    ]}
+    return body, markup
+
+
+def menu_section(category, requested_page=0):
+    if category not in MENU_CATEGORIES:
+        return menu_home()
+    title, _ = MENU_CATEGORIES[category]
+    all_items = [row for row in stored_orders()
+                 if category_for_status(row[3]) == category]
+    pages = max(1, (len(all_items) + MENU_PAGE_SIZE - 1) // MENU_PAGE_SIZE)
+    page = min(max(0, requested_page), pages - 1)
+    items = all_items[page * MENU_PAGE_SIZE:(page + 1) * MENU_PAGE_SIZE]
+    lines = [f'<b>{esc(title)}</b> · {len(all_items)}',
+             f'Страница {page + 1} из {pages}', '']
+    keyboard = []
+    if not items:
+        lines.append('Заказов в этом разделе пока нет.')
+    for shop_id, oid, payload, code, _ in items:
+        products = payload.get('products') or []
+        product = next((p.get('name') for p in products
+                        if isinstance(p, dict) and p.get('name')), 'Заказ')
+        lines.append(f'• <b>№{esc(oid)}</b> · {esc(status_label(code))}')
+        lines.append(f'   {esc(str(product)[:52])} · {esc(local_timestamp(payload.get("createdDate")))}')
+        keyboard.append([menu_button(
+            f'Открыть №{oid}',
+            f'km:v:{shop_id}:{oid}:{category}:{page}')])
+    if pages > 1:
+        paging = []
+        if page > 0:
+            paging.append(menu_button('◀️ Назад', f'km:{category}:{page - 1}'))
+        if page + 1 < pages:
+            paging.append(menu_button('Далее ▶️', f'km:{category}:{page + 1}'))
+        keyboard.append(paging)
+    keyboard.append([menu_button('🏠 Главное меню', 'km:h'),
+                     menu_button('🔄 Обновить', f'km:{category}:{page}')])
+    return '\n'.join(lines), {'inline_keyboard': keyboard}
+
+
+def menu_stats():
+    rows = stored_orders()
+    counts = menu_counts(rows)
+    labels = [('n', '🆕 Новые'), ('a', '✅ Принятые'), ('d', '🚚 На доставке'),
+              ('p', '🏪 Самовывоз'), ('c', '🏁 Завершённые'), ('o', '📦 Другие')]
+    lines = ['📊 <b>Статистика заказов</b>',
+             f'Всего сохранено: <b>{len(rows)}</b>', '']
+    for key, label in labels:
+        lines.append(f'{label}: <b>{counts[key]}</b>')
+    lines.append('')
+    lines.append(f'Последняя синхронизация: {esc(get_config("last_sync_at") or "ещё нет")} (МСК)')
+    lines.append('Данные из локальной базы; не финансовый отчёт Flowwow.')
+    return '\n'.join(lines), {'inline_keyboard': [
+        [menu_button('🔄 Обновить', 'km:s'), menu_button('🏠 Меню', 'km:h')]]}
+
+
+def menu_last():
+    row = stored_orders()
+    if not row:
+        text = '📭 Пока нет заказов Flowwow в локальной базе.'
+        return text, {'inline_keyboard': [[menu_button('🏠 Меню', 'km:h')]]}
+    shop_id, oid, payload, _, _ = row[0]
+    name = get_config(f'shop_name_{shop_id}') or f'Магазин №{shop_id}'
+    text = format_order(payload, name, title='🕒 <b>Последний сохранённый заказ</b>')
+    return text, {'inline_keyboard': [[menu_button('🏠 Меню', 'km:h')]]}
+
+
+def render_menu_callback(data):
+    if data == 'km:h':
+        return menu_home()
+    if data == 'km:s':
+        return menu_stats()
+    if data == 'km:l':
+        return menu_last()
+    parts = data.split(':')
+    if len(parts) == 3 and parts[0] == 'km' and parts[1] in MENU_CATEGORIES:
+        try:
+            return menu_section(parts[1], int(parts[2]))
+        except ValueError:
+            return menu_home()
+    if len(parts) == 6 and parts[0] == 'km' and parts[1] == 'v':
+        try:
+            shop_id, oid = int(parts[2]), int(parts[3])
+            category = parts[4]
+            page = int(parts[5])
+        except ValueError:
+            return menu_home()
+        if category not in MENU_CATEGORIES:
+            return menu_home()
+        with db() as c:
+            item = c.execute('SELECT payload FROM orders WHERE shop_id=? AND order_id=?',
+                             (shop_id, oid)).fetchone()
+        if item is None:
+            return 'Заказ не найден в локальной базе.', {'inline_keyboard': [
+                [menu_button('◀️ К списку', f'km:{category}:{page}')]]}
+        payload = json.loads(item[0])
+        name = get_config(f'shop_name_{shop_id}') or f'Магазин №{shop_id}'
+        return format_order(payload, name, title='🍰 <b>Карточка заказа</b>'), {
+            'inline_keyboard': [[menu_button('◀️ К списку', f'km:{category}:{page}'),
+                                 menu_button('🏠 Меню', 'km:h')]]}
+    return menu_home()
+
+
+def handle_callback(call):
+    data = str(call.get('data') or '')
+    ident = (call.get('message') or {}).get('chat', {}).get('id')
+    kind = (call.get('message') or {}).get('chat', {}).get('type')
+    message_id = (call.get('message') or {}).get('message_id')
+    user_id = (call.get('from') or {}).get('id')
+    owner = chat_id()
+    authorized = owner is not None and user_id == owner and (
+        kind == 'private' and ident == owner or
+        kind in ('group', 'supergroup') and
+        str(ident) == str(get_config('notify_chat_id')))
+    # Only the connected owner can browse orders and details.
+    if not authorized:
+        tg_call('answerCallbackQuery', {
+            'callback_query_id': call['id'],
+            'text': 'Меню заказов доступно только владельцу бота.',
+            'show_alert': False}, timeout=10)
+        return
+    if not data.startswith('km:'):
+        tg_call('answerCallbackQuery', {'callback_query_id': call['id']}, timeout=10)
+        return
+    tg_call('answerCallbackQuery', {'callback_query_id': call['id']}, timeout=10)
+    body, markup = render_menu_callback(data)
+    if message_id is not None:
+        tg_edit(ident, message_id, body, reply_markup=markup)
+
+
+def configure_telegram_menu():
+    commands = [
+        {'command': 'menu', 'description': 'Меню заказов 🍰'},
+        {'command': 'new', 'description': 'Новые заказы'},
+        {'command': 'accepted', 'description': 'Принятые заказы'},
+        {'command': 'delivery', 'description': 'Заказы на доставке'},
+        {'command': 'completed', 'description': 'Завершённые заказы'},
+        {'command': 'last', 'description': 'Последний заказ'},
+        {'command': 'status', 'description': 'Состояние бота'},
+        {'command': 'help', 'description': 'Список команд'},
+    ]
+    try:
+        tg_call('setMyCommands', {'commands': commands}, timeout=15)
+        tg_call('setChatMenuButton', {'menu_button': {'type': 'commands'}}, timeout=15)
+        LOG.info('Telegram native menu commands configured')
+    except Exception as exc:
+        # Bot notifications should remain working even when UI setup fails.
+        LOG.warning('Could not set Telegram menu commands: %s', type(exc).__name__)
 
 
 def handle_update(update):
@@ -513,7 +739,8 @@ def handle_update(update):
     # Only private messages may contain the setup secret. Never share it in a group.
     if kind == 'private' and action == '/start':
         if owner == ident:
-            tg_send(ident, '✅ @zakazKiT_bot подключён. Команды: /last, /status, /test, /teststatus, /group, /private, /help.')
+            body, markup = menu_home()
+            tg_send(ident, body, reply_markup=markup)
         elif owner is not None:
             tg_send(ident, 'Этот бот уже привязан к владельцу.')
         else:
@@ -524,7 +751,7 @@ def handle_update(update):
             tg_send(ident, 'SETUP_CODE ещё не задан в переменных окружения Bothost.')
         elif len(command) == 2 and len(SETUP_CODE) >= 8 and command[1] == SETUP_CODE:
             put_config('chat_id', ident)
-            tg_send(ident, '✅ Telegram подключён. Проверка новых заказов Flowwow запущена.')
+            tg_send(ident, '✅ Telegram подключён. Проверка новых заказов Flowwow запущена.\nОткрой меню командой /menu.')
             LOG.info('Telegram owner chat connected')
         else:
             tg_send(ident, 'Неверный код. Проверьте SETUP_CODE в настройках Bothost.')
@@ -573,7 +800,18 @@ def handle_update(update):
     # Do not let commands in unrelated groups disclose any order data.
     if kind in ('group', 'supergroup') and str(ident) != str(get_config('notify_chat_id')):
         return
-    if action == '/status':
+    if action == '/menu':
+        body, markup = menu_home()
+        tg_send(ident, body, reply_markup=markup)
+    elif action in ('/new', '/accepted', '/delivery', '/completed', '/pickup', '/other'):
+        category = {'/new': 'n', '/accepted': 'a', '/delivery': 'd',
+                    '/completed': 'c', '/pickup': 'p', '/other': 'o'}[action]
+        body, markup = menu_section(category)
+        tg_send(ident, body, reply_markup=markup)
+    elif action == '/stats':
+        body, markup = menu_stats()
+        tg_send(ident, body, reply_markup=markup)
+    elif action == '/status':
         with db() as c:
             shops = c.execute('SELECT COUNT(*) FROM shops_initialized').fetchone()[0]
             total = c.execute('SELECT COUNT(*) FROM orders WHERE notified=1').fetchone()[0]
@@ -603,7 +841,7 @@ def handle_update(update):
     elif action == '/test':
         tg_send(ident, '🔔 Тестовое уведомление @zakazKiT_bot — Telegram подключён.')
     elif action == '/help':
-        tg_send(ident, '/last — показать последний сохранённый заказ\n'
+        tg_send(ident, '/menu — открыть меню с кнопками\n/new — новые\n/accepted — принятые\n/delivery — на доставке\n/completed — завершённые\n/stats — сводка\n/last — показать последний сохранённый заказ\n'
                        '/status — состояние\n/test — проверить доставку\n/teststatus — тест редактирования карточки\n'
                        '/bindgroup — привязать группу (от владельца, в группе)\n'
                        '/unbindgroup — отвязать группу (от владельца, в группе)\n'
@@ -615,11 +853,14 @@ def telegram_loop():
     offset = int(get_config('tg_offset') or 0)
     while not shutdown.is_set():
         try:
-            updates = tg_call('getUpdates', {'offset': offset, 'timeout': 20, 'allowed_updates': ['message']}, timeout=30)
+            updates = tg_call('getUpdates', {'offset': offset, 'timeout': 20, 'allowed_updates': ['message', 'callback_query']}, timeout=30)
             for u in updates:
                 current = int(u['update_id'])
                 try:
-                    handle_update(u)
+                    if 'callback_query' in u:
+                        handle_callback(u['callback_query'])
+                    else:
+                        handle_update(u)
                 except Exception as exc:
                     LOG.warning('Telegram command handling error: %s', type(exc).__name__)
                 offset = current + 1
@@ -643,6 +884,7 @@ def main():
     if SETUP_CODE and len(SETUP_CODE) < 8:
         raise SystemExit('SETUP_CODE must contain at least 8 characters')
     init_db()
+    configure_telegram_menu()
     LOG.info('@zakazKiT_bot started; checking every %s seconds', POLL_SECONDS)
     task = threading.Thread(target=worker, daemon=True)
     task.start()
